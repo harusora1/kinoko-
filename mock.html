@@ -1,0 +1,666 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <title>リス重力アクション [MOCK]</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0a0515;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      overflow: hidden;
+      font-family: 'Segoe UI', sans-serif;
+      touch-action: none;
+    }
+    canvas { display: block; border: 2px solid #7b3fb0; border-radius: 12px; }
+    #gyro-btn {
+      margin-top: 10px; padding: 10px 28px; background: #7b3fb0;
+      color: #fff; border: none; border-radius: 8px; font-size: 15px;
+      cursor: pointer; display: none;
+    }
+    #hint { margin-top: 7px; color: #666; font-size: 11px; text-align: center; }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <button id="gyro-btn">ジャイロを有効にする (iOS)</button>
+  <div id="hint">PC: ← → 横傾き &nbsp;|&nbsp; ↑ 上重力 / ↓ 下重力 &nbsp;|&nbsp; スマホ: 前後左右に傾ける</div>
+
+<script>
+// ── Canvas ─────────────────────────────────────────
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+const W = 360, H = 480;
+canvas.width = W; canvas.height = H;
+
+(function resize() {
+  const s = Math.min(window.innerHeight * 0.88 / H, window.innerWidth * 0.96 / W);
+  canvas.style.width = W * s + 'px';
+  canvas.style.height = H * s + 'px';
+})();
+window.addEventListener('resize', () => {
+  const s = Math.min(window.innerHeight * 0.88 / H, window.innerWidth * 0.96 / W);
+  canvas.style.width = W * s + 'px'; canvas.style.height = H * s + 'px';
+});
+
+// ── Tile constants ─────────────────────────────────
+const T = 32;                     // tile size px
+const COLS = 50;                  // level width in tiles
+const ROWS = Math.floor(H / T);   // = 15
+
+const EMPTY  = 0;
+const GROUND = 1;
+const DANGER = 2;
+const STAR   = 3;
+const GOAL   = 4;
+
+// ── Level ──────────────────────────────────────────
+function buildGrid() {
+  const G = Array.from({length: ROWS}, () => Array(COLS).fill(EMPTY));
+  const s = (tx, ty, v) => { if (tx>=0&&tx<COLS&&ty>=0&&ty<ROWS) G[ty][tx]=v; };
+  const row = (ty, x0, len, v) => { for(let i=0;i<len;i++) s(x0+i, ty, v); };
+
+  // Ceiling (row 0) & Floor (row 14)
+  for (let x=0;x<COLS;x++) { G[0][x]=GROUND; G[ROWS-1][x]=GROUND; }
+
+  // Goal (bottom-right)
+  s(COLS-3, ROWS-1, GOAL);
+
+  // ── Stars near ceiling (requires gravity flip) ──
+  s(5,  2, STAR);
+  s(20, 2, STAR);
+  s(36, 2, STAR);
+
+  // ── Upper platforms (near ceiling, gravity-flip zone) ──
+  row(3, 3,  4, GROUND);
+  row(3, 14, 4, GROUND);
+  row(3, 26, 4, GROUND);
+  row(3, 39, 4, GROUND);
+
+  // danger guarding upper platforms
+  s(7,  4, DANGER); s(8,  4, DANGER);
+  s(18, 4, DANGER);
+  s(30, 4, DANGER);
+  s(43, 4, DANGER); s(44, 4, DANGER);
+
+  // ── Mid platforms ──
+  row(7,  5,  3, GROUND);
+  row(6,  12, 4, GROUND);
+  row(7,  19, 3, GROUND);
+  row(6,  26, 4, GROUND);
+  row(7,  33, 3, GROUND);
+  row(6,  40, 4, GROUND);
+
+  // Mid danger
+  s(9,  8,  DANGER);
+  s(17, 7,  DANGER);
+  s(23, 8,  DANGER); s(24, 8, DANGER);
+  s(30, 7,  DANGER);
+  s(37, 8,  DANGER);
+  s(44, 7,  DANGER);
+
+  // ── Lower platforms ──
+  row(11, 3,  3, GROUND);
+  row(10, 10, 4, GROUND);
+  row(11, 18, 3, GROUND);
+  row(10, 25, 4, GROUND);
+  row(11, 32, 3, GROUND);
+  row(10, 39, 4, GROUND);
+
+  // Lower danger
+  s(6,  12, DANGER); s(7,  12, DANGER);
+  s(14, 11, DANGER);
+  s(22, 12, DANGER);
+  s(29, 11, DANGER); s(30, 11, DANGER);
+  s(36, 12, DANGER);
+  s(43, 11, DANGER);
+
+  return G;
+}
+
+let GRID = buildGrid();
+function getTile(tx, ty) {
+  if (tx<0||tx>=COLS||ty<0||ty>=ROWS) return GROUND;
+  return GRID[ty][tx];
+}
+
+// ── Physics ────────────────────────────────────────
+const GRAV   = 0.44;
+const MAXVEL = 10;
+const FRIC_G = 0.76;
+const FRIC_A = 0.97;
+
+// ── Squirrel image ─────────────────────────────────
+let squirrelCanvas = null;
+
+{
+  const img = new Image();
+  img.onload = () => {
+    const oc = document.createElement('canvas');
+    oc.width = img.width; oc.height = img.height;
+    const c2 = oc.getContext('2d');
+    c2.drawImage(img, 0, 0);
+    try {
+      const id = c2.getImageData(0, 0, oc.width, oc.height);
+      const d = id.data;
+      for (let i = 0; i < d.length; i += 4) {
+        const r=d[i], g=d[i+1], b=d[i+2];
+        // Remove near-white background
+        const mn = Math.min(r,g,b);
+        if (r > 210 && g > 205 && b > 200) {
+          const t = Math.min(1, (mn - 195) / 45);
+          d[i+3] = Math.round(d[i+3] * (1 - t));
+        }
+      }
+      c2.putImageData(id, 0, 0);
+    } catch(e) {}
+    squirrelCanvas = oc;
+  };
+  img.src = 'リス.jpg';
+}
+
+// ── State ──────────────────────────────────────────
+let gravDir = 1;          // 1=下向き -1=上向き (gravYの符号から自動更新)
+let gravX = 0;            // 横方向重力 (gammaから)
+let gravY = GRAV;         // 縦方向重力 (betaから) ← 追加
+let flashAlpha = 0;
+let gameState = 'idle';
+let frame = 0, stars = 0, deathTimer = 0;
+let player, cam;
+
+function makePlayer() {
+  return {
+    x: T * 1.5, y: (ROWS - 2) * T - 34,
+    vx: 0, vy: 0,
+    w: 24, h: 32,
+    onGround: false,
+    facingRight: true,
+    squish: 1,
+    dead: false,
+    walkT: 0,
+  };
+}
+
+// ── Gyroscope ──────────────────────────────────────
+let gyroOn = false, betaV = 0, gammaV = 0;
+
+function onOrientation(e) {
+  betaV = e.beta ?? 90; gammaV = e.gamma ?? 0;
+  gyroOn = true;
+
+  // 横方向重力: gamma (左右傾き)
+  const deadH = 8;
+  const hTilt = Math.abs(gammaV) > deadH ? gammaV : 0;
+  gravX = (hTilt / 45) * GRAV * 1.6;
+
+  // 縦方向重力: sin(beta_rad) でアナログ制御
+  //   beta=90 (通常縦持ち) → sin(90°)=1  → gravY=+GRAV (下)
+  //   beta=0  (水平)       → sin(0°)=0   → gravY=0
+  //   beta=-90 (後ろに倒す) → sin(-90°)=-1 → gravY=-GRAV (上)
+  const rawGravY = Math.sin(betaV * Math.PI / 180) * GRAV * 2.2;
+  gravY = rawGravY;
+
+  // gravDir はgravYの符号から更新（ヒステリシス付き）
+  if (gravY >  GRAV * 0.25 && gravDir !== 1)  { gravDir = 1;  flashAlpha = 1; if(player) player.vy *= 0.2; }
+  if (gravY < -GRAV * 0.25 && gravDir !== -1) { gravDir = -1; flashAlpha = 1; if(player) player.vy *= 0.2; }
+}
+
+const gyroBtn = document.getElementById('gyro-btn');
+if (typeof DeviceOrientationEvent !== 'undefined' &&
+    typeof DeviceOrientationEvent.requestPermission === 'function') {
+  gyroBtn.style.display = 'inline-block';
+  gyroBtn.addEventListener('click', async () => {
+    if (await DeviceOrientationEvent.requestPermission() === 'granted') {
+      window.addEventListener('deviceorientation', onOrientation);
+      gyroBtn.style.display = 'none';
+    }
+  });
+} else {
+  window.addEventListener('deviceorientation', onOrientation);
+}
+
+// ── Keyboard ───────────────────────────────────────
+const keys = {};
+document.addEventListener('keydown', e => {
+  keys[e.code] = true;
+  if (e.code==='Space') { e.preventDefault(); handleTap(); }
+  // ↑↓はapplyKeyTiltで毎フレーム処理するのでここでは preventDefault のみ
+  if (e.code==='ArrowUp'||e.code==='ArrowDown') e.preventDefault();
+});
+document.addEventListener('keyup', e => { keys[e.code] = false; });
+canvas.addEventListener('click', handleTap);
+
+function handleTap() {
+  if (gameState==='idle'||gameState==='dead'||gameState==='cleared') startGame();
+}
+
+function applyKeyTilt() {
+  if (gyroOn) return;
+  // 横: ← →
+  if (keys['ArrowLeft'])       gravX = -GRAV * 1.4;
+  else if (keys['ArrowRight']) gravX =  GRAV * 1.4;
+  else                         gravX = 0;
+  // 縦: ↑ ↓ (ホールドでアナログ重力、ジャイロと同じ操作感)
+  if (keys['ArrowUp'])         gravY = -GRAV * 2.0;
+  else if (keys['ArrowDown'])  gravY =  GRAV * 2.0;
+  else                         gravY =  GRAV;        // デフォルトは下向き
+  // gravDir 更新
+  const newDir = gravY >= 0 ? 1 : -1;
+  if (newDir !== gravDir) { gravDir = newDir; flashAlpha = 1; player.vy *= 0.2; }
+}
+
+// ── Physics ────────────────────────────────────────
+function updatePlayer() {
+  const p = player;
+  if (p.dead) return;
+
+  applyKeyTilt();
+
+  // Horizontal (gravity-driven)
+  p.vx += gravX;
+  p.vx *= p.onGround ? FRIC_G : FRIC_A;
+  p.vx = Math.max(-MAXVEL, Math.min(MAXVEL, p.vx));
+
+  p.x += p.vx;
+  resolveX(p);
+  p.x = Math.max(0, Math.min(COLS*T - p.w, p.x));
+
+  // Vertical (gravY はアナログ値)
+  p.vy += gravY;
+  p.vy = Math.max(-MAXVEL, Math.min(MAXVEL, p.vy));
+  p.y += p.vy;
+  p.onGround = false;
+  resolveY(p);
+
+  p.squish += (1 - p.squish) * 0.15;
+  if (p.onGround && Math.abs(p.vx) > 0.2) p.walkT += Math.abs(p.vx) * 0.06;
+  if (Math.abs(p.vx) > 0.4) p.facingRight = p.vx > 0;
+
+  // Star pickup
+  const tx0=Math.floor(p.x/T), ty0=Math.floor(p.y/T);
+  const tx1=Math.floor((p.x+p.w-1)/T), ty1=Math.floor((p.y+p.h-1)/T);
+  for (let ty=ty0;ty<=ty1;ty++) for (let tx=tx0;tx<=tx1;tx++) {
+    if (getTile(tx,ty)===STAR) { GRID[ty][tx]=EMPTY; stars++; }
+  }
+}
+
+function resolveX(p) {
+  const tx0=Math.floor(p.x/T), ty0=Math.floor(p.y/T);
+  const tx1=Math.floor((p.x+p.w-1)/T), ty1=Math.floor((p.y+p.h-1)/T);
+  for (let ty=ty0;ty<=ty1;ty++) for (let tx=tx0;tx<=tx1;tx++) {
+    const tp = getTile(tx, ty);
+    if (tp===EMPTY||tp===STAR) continue;
+    const tileX = tx*T, tileY = ty*T;
+    const ox = Math.min(p.x+p.w, tileX+T) - Math.max(p.x, tileX);
+    const oy = Math.min(p.y+p.h, tileY+T) - Math.max(p.y, tileY);
+    if (ox<=0||oy<=0) continue;
+    if (tp===DANGER) { p.dead=true; deathTimer=1; return; }
+    if (tp===GOAL)   { gameState='cleared'; return; }
+    // GROUND: push out
+    if (p.x+p.w/2 < tileX+T/2) p.x = tileX - p.w;
+    else                         p.x = tileX + T;
+    p.vx = 0;
+  }
+}
+
+function resolveY(p) {
+  const tx0=Math.floor(p.x/T), ty0=Math.floor(p.y/T);
+  const tx1=Math.floor((p.x+p.w-1)/T), ty1=Math.floor((p.y+p.h-1)/T);
+  for (let ty=ty0;ty<=ty1;ty++) for (let tx=tx0;tx<=tx1;tx++) {
+    const tp = getTile(tx, ty);
+    if (tp===EMPTY||tp===STAR) continue;
+    const tileX = tx*T, tileY = ty*T;
+    const ox = Math.min(p.x+p.w, tileX+T) - Math.max(p.x, tileX);
+    const oy = Math.min(p.y+p.h, tileY+T) - Math.max(p.y, tileY);
+    if (ox<=0||oy<=0) continue;
+    if (tp===DANGER) { p.dead=true; deathTimer=1; return; }
+    if (tp===GOAL)   { gameState='cleared'; return; }
+    // GROUND
+    if (p.vy >= 0) {
+      p.y = tileY - p.h; p.vy = 0;
+      if (gravDir===1) { p.onGround=true; p.squish=0.70; }
+    } else {
+      p.y = tileY + T; p.vy = 0;
+      if (gravDir===-1) { p.onGround=true; p.squish=0.70; }
+    }
+  }
+}
+
+// ── Camera ─────────────────────────────────────────
+function updateCam() {
+  const tx = player.x + player.w/2 - W/2 + player.vx * 6;
+  cam += (tx - cam) * 0.1;
+  cam = Math.max(0, Math.min(COLS*T - W, cam));
+}
+
+// ── Draw: background ───────────────────────────────
+function drawBg() {
+  const g = ctx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,'#06030f'); g.addColorStop(0.6,'#100520'); g.addColorStop(1,'#0d1228');
+  ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+  // Stars
+  ctx.fillStyle='rgba(255,255,255,0.45)';
+  for(let i=0;i<30;i++){
+    const sx=((i*131.7-cam*0.04)%W+W)%W;
+    const sy=(i*83.1+10)%(H*0.65);
+    ctx.fillRect(sx,sy,i%4===0?1.5:1,i%4===0?1.5:1);
+  }
+  // Parallax tree silhouettes
+  ctx.fillStyle='rgba(15,8,30,0.9)';
+  for(let i=0;i<18;i++){
+    const bx=((i*180+60)-cam*0.18+W*2)%((COLS*T)*0.18+W)-50;
+    const bh=60+i%5*18;
+    ctx.fillRect(bx, H-bh-T, 28, bh);
+    ctx.beginPath();
+    ctx.arc(bx+14, H-bh-T-18, 22, 0, Math.PI*2);
+    ctx.fill();
+  }
+}
+
+// ── Draw: tiles ─────────────────────────────────────
+function drawTiles() {
+  const startTx = Math.max(0, Math.floor(cam/T));
+  const endTx   = Math.min(COLS-1, startTx + Math.ceil(W/T) + 1);
+  for (let ty=0;ty<ROWS;ty++) {
+    for (let tx=startTx;tx<=endTx;tx++) {
+      const tp = GRID[ty][tx];
+      if (tp===EMPTY) continue;
+      const sx = tx*T - cam, sy = ty*T;
+      if      (tp===GROUND) drawGroundTile(sx,sy);
+      else if (tp===DANGER) drawDangerTile(sx,sy);
+      else if (tp===STAR)   drawStarTile(sx,sy);
+      else if (tp===GOAL)   drawGoalTile(sx,sy);
+    }
+  }
+}
+
+function drawGroundTile(x,y) {
+  // Cube face
+  ctx.fillStyle='#7a5c10';
+  ctx.fillRect(x,y,T,T);
+  // Top highlight
+  ctx.fillStyle='#b08820';
+  ctx.fillRect(x,y,T,5);
+  // Left lighter edge
+  ctx.fillStyle='#8a6a15';
+  ctx.fillRect(x,y,4,T);
+  // Right/bottom shadow
+  ctx.fillStyle='#4a3800';
+  ctx.fillRect(x+T-3,y,3,T);
+  ctx.fillRect(x,y+T-3,T,3);
+  // Subtle dot grid texture
+  ctx.fillStyle='rgba(255,200,50,0.10)';
+  for(let di=0;di<3;di++) for(let dj=0;dj<3;dj++)
+    ctx.fillRect(x+7+di*9, y+7+dj*9, 2, 2);
+  // Tile border
+  ctx.strokeStyle='rgba(0,0,0,0.35)';
+  ctx.lineWidth=0.5;
+  ctx.strokeRect(x+0.5,y+0.5,T-1,T-1);
+}
+
+function drawDangerTile(x,y) {
+  // Red cube base
+  ctx.fillStyle='#a82020';
+  ctx.fillRect(x,y,T,T);
+  ctx.fillStyle='#d03030';
+  ctx.fillRect(x,y,T,5);
+  ctx.fillStyle='#701010';
+  ctx.fillRect(x+T-3,y,3,T);
+  ctx.fillRect(x,y+T-3,T,3);
+  // X mark
+  ctx.strokeStyle='#ff6060';
+  ctx.lineWidth=2.5;
+  ctx.lineCap='round';
+  ctx.beginPath();
+  ctx.moveTo(x+7,y+7);   ctx.lineTo(x+T-7,y+T-7);
+  ctx.moveTo(x+T-7,y+7); ctx.lineTo(x+7,y+T-7);
+  ctx.stroke();
+  // Spikes on top
+  ctx.fillStyle='#ff5050';
+  for(let i=0;i<3;i++){
+    const sx=x+5+i*10;
+    ctx.beginPath();
+    ctx.moveTo(sx+4, y);
+    ctx.lineTo(sx,   y+7);
+    ctx.lineTo(sx+8, y+7);
+    ctx.closePath(); ctx.fill();
+  }
+  ctx.strokeStyle='rgba(0,0,0,0.4)';
+  ctx.lineWidth=0.5;
+  ctx.strokeRect(x+0.5,y+0.5,T-1,T-1);
+}
+
+function drawStarTile(x,y) {
+  const bob = Math.sin(frame*0.07)*2.5;
+  ctx.save();
+  ctx.shadowBlur=16; ctx.shadowColor='#ffd700';
+  ctx.fillStyle='#ffd700';
+  ctx.font=`bold ${T-4}px serif`;
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.fillText('★', x+T/2, y+T/2+bob);
+  ctx.restore();
+}
+
+function drawGoalTile(x,y) {
+  const p = 1+Math.sin(frame*0.09)*0.12;
+  ctx.save();
+  ctx.translate(x+T/2, y+T/2); ctx.scale(p,p);
+  ctx.font=`${T*0.9}px serif`;
+  ctx.textAlign='center'; ctx.textBaseline='middle';
+  ctx.shadowBlur=18; ctx.shadowColor='#00ff88';
+  ctx.fillText('🚪',0,0);
+  ctx.restore();
+}
+
+// ── Draw: squirrel ──────────────────────────────────
+function drawPlayer() {
+  const p = player;
+  const sx = p.x - cam + p.w/2;
+  const sy = p.y + p.h/2;
+  const iw = p.w * 2.6, ih = p.h * 2.4;
+
+  ctx.save();
+  ctx.translate(sx, sy);
+  // Face direction
+  if (!p.facingRight) ctx.scale(-1, 1);
+  // Flip upside-down when gravity reversed
+  ctx.scale(2 - p.squish, p.squish * gravDir);
+  // Death fade + spin
+  if (p.dead) { ctx.rotate(deathTimer * Math.PI * 5); ctx.globalAlpha = deathTimer; }
+
+  if (squirrelCanvas) {
+    ctx.drawImage(squirrelCanvas, -iw/2, -ih/2, iw, ih);
+  } else {
+    drawFallbackSquirrel(iw, ih, p.walkT);
+  }
+  ctx.restore();
+}
+
+function drawFallbackSquirrel(iw, ih, wt) {
+  const hw=iw/2, hh=ih/2;
+  // Fluffy tail
+  ctx.fillStyle='#b05818';
+  ctx.beginPath(); ctx.ellipse(hw*0.45,-hh*0.1,hw*0.7,hh*0.85,0.4,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#cc6820';
+  ctx.beginPath(); ctx.ellipse(hw*0.35,-hh*0.2,hw*0.5,hh*0.6,0.4,0,Math.PI*2); ctx.fill();
+  // Body
+  ctx.fillStyle='#c8642c';
+  ctx.beginPath(); ctx.ellipse(0,hh*0.1,hw*0.6,hh*0.62,0,0,Math.PI*2); ctx.fill();
+  // Belly
+  ctx.fillStyle='#f0c880';
+  ctx.beginPath(); ctx.ellipse(-hw*0.05,hh*0.18,hw*0.28,hh*0.36,0,0,Math.PI*2); ctx.fill();
+  // Head
+  ctx.fillStyle='#c8642c';
+  ctx.beginPath(); ctx.arc(-hw*0.08,-hh*0.55,hw*0.44,0,Math.PI*2); ctx.fill();
+  // Ears
+  ctx.fillStyle='#a04818';
+  ctx.beginPath(); ctx.ellipse(-hw*0.28,-hh*0.88,5,8,-0.4,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.ellipse(hw*0.12,-hh*0.88,5,8,0.4,0,Math.PI*2); ctx.fill();
+  // Eyes
+  ctx.fillStyle='#1a0800';
+  ctx.beginPath(); ctx.arc(-hw*0.22,-hh*0.56,3.5,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(hw*0.06,-hh*0.54,3.5,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='white';
+  ctx.beginPath(); ctx.arc(-hw*0.20,-hh*0.59,1.3,0,Math.PI*2); ctx.fill();
+  ctx.beginPath(); ctx.arc(hw*0.08,-hh*0.57,1.3,0,Math.PI*2); ctx.fill();
+  // Nose
+  ctx.fillStyle='#7a2800';
+  ctx.beginPath(); ctx.arc(hw*0.14,-hh*0.44,2.2,0,Math.PI*2); ctx.fill();
+  // Legs
+  const ls = Math.sin(wt*Math.PI)*4;
+  ctx.fillStyle='#a04818';
+  ctx.fillRect(-hw*0.22, hh*0.62, 9, 12+ls);
+  ctx.fillRect(hw*0.08,  hh*0.62, 9, 12-ls);
+}
+
+// ── HUD ────────────────────────────────────────────
+function drawGravHUD() {
+  const x=W-36, y=72, r=22;
+  ctx.save(); ctx.globalAlpha=0.85;
+  // 背景
+  ctx.fillStyle='rgba(0,0,0,0.55)';
+  ctx.beginPath(); ctx.arc(x,y,r+5,0,Math.PI*2); ctx.fill();
+  // 十字線
+  ctx.strokeStyle='rgba(255,255,255,0.15)'; ctx.lineWidth=1;
+  ctx.beginPath(); ctx.moveTo(x-r,y); ctx.lineTo(x+r,y); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(x,y-r); ctx.lineTo(x,y+r); ctx.stroke();
+  // 重力ベクトル矢印 (gravX, gravY を正規化して描画)
+  const mag = Math.sqrt(gravX*gravX + gravY*gravY) || 0.001;
+  const nx = gravX/mag, ny = gravY/mag;
+  const len = r * 0.75;
+  const ex = x + nx*len, ey = y + ny*len;
+  const col = gravDir===1 ? '#80b4ff' : '#ff7096';
+  ctx.strokeStyle=col; ctx.lineWidth=2.8; ctx.lineCap='round';
+  ctx.beginPath(); ctx.moveTo(x,y); ctx.lineTo(ex,ey); ctx.stroke();
+  // 矢印の頭
+  const angle = Math.atan2(ny, nx);
+  ctx.fillStyle=col;
+  ctx.beginPath();
+  ctx.moveTo(ex, ey);
+  ctx.lineTo(ex - Math.cos(angle-0.5)*8, ey - Math.sin(angle-0.5)*8);
+  ctx.lineTo(ex - Math.cos(angle+0.5)*8, ey - Math.sin(angle+0.5)*8);
+  ctx.closePath(); ctx.fill();
+  // ラベル
+  ctx.fillStyle='#aaa'; ctx.font='8px sans-serif'; ctx.textAlign='center';
+  ctx.fillText('重力', x, y+r+14);
+  ctx.restore();
+}
+
+function drawStarHUD() {
+  ctx.save();
+  ctx.fillStyle='rgba(0,0,0,0.45)';
+  roundRect(8,8,120,28,7); ctx.fill();
+  ctx.fillStyle='#ffd700'; ctx.font='bold 13px sans-serif';
+  ctx.textAlign='left'; ctx.textBaseline='middle';
+  ctx.fillText(`★  ${stars} / 3`, 16, 22);
+  if (gyroOn) { ctx.fillStyle='#69f0ae'; ctx.font='8px sans-serif'; ctx.fillText('GYRO ON',16,34); }
+  ctx.restore();
+}
+
+function drawMinimap() {
+  const mw=90, mh=10, mx=W/2-mw/2, my=H-16;
+  ctx.fillStyle='rgba(0,0,0,0.55)'; ctx.fillRect(mx,my,mw,mh);
+  const px2=mx+(player.x/(COLS*T))*mw;
+  ctx.fillStyle='#ffd700'; ctx.fillRect(px2-2,my,4,mh);
+  const gx2=mx+((COLS-3)*T/(COLS*T))*mw;
+  ctx.fillStyle='#00e676'; ctx.fillRect(gx2-1,my,3,mh);
+  ctx.strokeStyle='rgba(255,255,255,0.25)'; ctx.lineWidth=1; ctx.strokeRect(mx,my,mw,mh);
+}
+
+function roundRect(x,y,w,h,r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r,y); ctx.lineTo(x+w-r,y);
+  ctx.quadraticCurveTo(x+w,y,x+w,y+r); ctx.lineTo(x+w,y+h-r);
+  ctx.quadraticCurveTo(x+w,y+h,x+w-r,y+h); ctx.lineTo(x+r,y+h);
+  ctx.quadraticCurveTo(x,y+h,x,y+h-r); ctx.lineTo(x,y+r);
+  ctx.quadraticCurveTo(x,y,x+r,y); ctx.closePath();
+}
+
+function drawFlash() {
+  if (flashAlpha<=0) return;
+  ctx.fillStyle=`rgba(160,80,255,${flashAlpha*0.22})`;
+  ctx.fillRect(0,0,W,H);
+  flashAlpha=Math.max(0,flashAlpha-0.07);
+}
+
+// ── Overlays ───────────────────────────────────────
+function drawOverlay() {
+  ctx.textAlign='center'; ctx.textBaseline='alphabetic';
+
+  if (gameState==='idle') {
+    ctx.fillStyle='rgba(0,0,0,0.65)'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#d07030'; ctx.font='bold 26px sans-serif';
+    ctx.fillText('リス重力アクション', W/2, H/2-68);
+    ctx.fillStyle='#999'; ctx.font='10px sans-serif';
+    ctx.fillText('[MOCK v0.2]', W/2, H/2-48);
+    ctx.fillStyle='#ddd'; ctx.font='13px sans-serif';
+    ctx.fillText('スマホを傾けてリスを動かそう！', W/2, H/2-16);
+    ctx.fillStyle='#a0c4ff'; ctx.font='12px sans-serif';
+    ctx.fillText('逆さにすると重力反転 → ★3つ集めて 🚪 へ', W/2, H/2+8);
+    ctx.fillStyle='#666'; ctx.font='10px sans-serif';
+    ctx.fillText('PC: ← → 傾き / F・↑↓ 重力反転', W/2, H/2+30);
+    ctx.fillStyle='#ffd700'; ctx.font='bold 14px sans-serif';
+    ctx.fillText('タップ or スペースでスタート', W/2, H/2+58);
+
+  } else if (gameState==='dead') {
+    ctx.fillStyle='rgba(0,0,0,0.62)'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#e74c3c'; ctx.font='bold 30px sans-serif';
+    ctx.fillText('💥 やられた！', W/2, H/2-16);
+    ctx.fillStyle='#aaa'; ctx.font='13px sans-serif';
+    ctx.fillText('タップでリトライ', W/2, H/2+18);
+
+  } else if (gameState==='cleared') {
+    ctx.fillStyle='rgba(0,0,0,0.62)'; ctx.fillRect(0,0,W,H);
+    ctx.fillStyle='#ffd700'; ctx.font='bold 30px sans-serif';
+    ctx.fillText('🎉 クリア！', W/2, H/2-20);
+    ctx.fillStyle='#fff'; ctx.font='16px sans-serif';
+    ctx.fillText(`★ ${stars} / 3 収集`, W/2, H/2+14);
+    ctx.fillStyle='#a0c4ff'; ctx.font='13px sans-serif';
+    ctx.fillText('タップでリトライ', W/2, H/2+44);
+  }
+}
+
+// ── Game flow ──────────────────────────────────────
+function startGame() {
+  gameState='playing'; gravDir=1; gravX=0;
+  frame=0; stars=0; deathTimer=0;
+  GRID = buildGrid();
+  player = makePlayer();
+  cam = 0;
+}
+
+// ── Main loop ──────────────────────────────────────
+function update() {
+  if (gameState!=='playing') return;
+  frame++;
+  updatePlayer();
+  updateCam();
+  if (player.dead) {
+    deathTimer -= 0.025;
+    if (deathTimer<=0) gameState='dead';
+  }
+}
+
+function draw() {
+  drawBg();
+  drawTiles();
+  if (gameState==='playing'||gameState==='cleared') drawPlayer();
+  drawGravHUD();
+  drawFlash();
+  if (gameState!=='idle') { drawStarHUD(); drawMinimap(); }
+  drawOverlay();
+}
+
+function loop() { update(); draw(); requestAnimationFrame(loop); }
+
+player = makePlayer();
+cam = 0;
+loop();
+</script>
+</body>
+</html>
